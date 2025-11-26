@@ -6,5 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
 	"python-dotenv",
+	"langchain",
+	"langchain-openai",
+	"langchain-community",
 	# add your dependencies here and run `uv sync` to install them
+	"langchain-core>=1.1.0",
+	"langgraph>=0.2.0",
 ]
