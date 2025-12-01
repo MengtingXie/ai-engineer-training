@@ -1,19 +1,23 @@
 """
 Smart Customer Service Agent: Combines temporal reasoning and tool calling
 A complete customer service chatbot with intelligent time understanding and action capabilities
+Includes hot-reloadable plugin system for dynamic tool loading
 """
 
 import os
 import re
+import logging
 from datetime import datetime, timedelta
-from typing import TypedDict, Annotated, Sequence, Dict, Any
+from typing import TypedDict, Annotated, Sequence, Dict, Any, List
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+from langchain_core.tools import tool, BaseTool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -248,7 +252,23 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-tools = [query_order, query_orders_by_date, process_refund, check_refund_status]
+base_tools = [query_order, query_orders_by_date, process_refund, check_refund_status]
+
+# For backward compatibility
+tools = base_tools
+
+
+def load_plugins() -> List[BaseTool]:
+    """Load all plugins and return their tools"""
+    try:
+        from .plugin_loader import PluginLoader
+        loader = PluginLoader()
+        plugin_tools = loader.load_all_plugins()
+        logger.info(f"Loaded {len(plugin_tools)} tools from {loader.loaded_plugins.keys()}")
+        return plugin_tools
+    except Exception as e:
+        logger.warning(f"Could not load plugins: {e}")
+        return []
 
 
 def preprocess_temporal_expressions(text: str) -> tuple[str, dict]:
@@ -279,20 +299,36 @@ def preprocess_temporal_expressions(text: str) -> tuple[str, dict]:
     return text, context
 
 
-def create_agent():
+def create_agent(include_plugins: bool = True, use_mock: bool = False):
     """
     Create the customer service agent with temporal reasoning and tool calling
+
+    Args:
+        include_plugins: Whether to load and include plugin tools (default: True)
+        use_mock: Use mock LLM for testing without API key (default: False)
     """
     load_dotenv()
 
-    llm = ChatOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE"),
-        model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-        temperature=0.7
-    )
+    # Use mock LLM if requested or if no API key
+    if use_mock or not os.getenv("OPENAI_API_KEY"):
+        from langchain_core.language_models.fake_chat_models import FakeChatModel
+        logger.warning("⚠️  Using Mock LLM (no API calls)")
+        llm = FakeChatModel()
+    else:
+        llm = ChatOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_API_BASE"),
+            model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+            temperature=0.7
+        )
 
-    llm_with_tools = llm.bind_tools(tools)
+    # Combine base tools with plugin tools
+    all_tools = base_tools.copy()
+    if include_plugins:
+        plugin_tools = load_plugins()
+        all_tools.extend(plugin_tools)
+
+    llm_with_tools = llm.bind_tools(all_tools)
 
     def should_continue(state: AgentState):
         """Determine whether to continue or end"""
@@ -310,20 +346,26 @@ def create_agent():
         # Add system message if not present
         if not messages or not isinstance(messages[0], SystemMessage):
             current_time = datetime.now()
-            system_message = SystemMessage(content=f"""你是一个专业的智能客服助手，负责处理订单查询、退款申请等客户服务事务。
+
+            # Build tool descriptions
+            tool_descriptions = []
+            for tool in all_tools:
+                tool_descriptions.append(f"- {tool.name}: {tool.description}")
+
+            tools_text = "\n".join(tool_descriptions)
+
+            system_message = SystemMessage(content=f"""你是一个专业的智能客服助手，负责处理订单查询、退款申请、发票管理等客户服务事务。
 
 当前时间：{current_time.strftime('%Y年%m月%d日 %H:%M:%S')}
 
 核心能力：
 1. 时间理解：自动识别"昨天"、"今天"、"前天"、"3天前"等相对时间表达，并转换为具体日期
-2. 订单查询：根据订单号或日期查询订单信息
-3. 退款处理：处理退款申请和查询退款状态
+2. 订单管理：查询订单信息、处理退款申请
+3. 发票服务：查询和申请发票
+4. 多轮对话：记住上下文，提供连贯的服务
 
-可用工具：
-- query_order(order_id): 根据订单号查询订单详情
-- query_orders_by_date(date_str): 根据日期(YYYY-MM-DD格式)查询订单列表
-- process_refund(order_id, reason): 处理退款申请
-- check_refund_status(refund_id): 查询退款状态
+可用工具（{len(all_tools)}个）：
+{tools_text}
 
 工作准则：
 - 友善、专业的语调
@@ -348,7 +390,7 @@ def create_agent():
     workflow = StateGraph(AgentState)
 
     workflow.add_node("agent", call_model)
-    workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("tools", ToolNode(all_tools))
 
     workflow.set_entry_point("agent")
 
@@ -373,23 +415,39 @@ def create_agent():
 def chat_session():
     """
     Interactive chat session with temporal reasoning and tool calling
+    Includes all stages: temporal reasoning, tool calling, and plugin system
     """
     print("=== 智能客服系统 ===")
-    print("✨ 时间推理 + 多轮对话 + 工具调用")
+    print("✨ 时间推理 + 多轮对话 + 工具调用 + 插件系统")
     print()
-    print("功能列表：")
+    print("核心功能：")
     print("  📅 智能时间理解（昨天、今天、前天、N天前等）")
     print("  📦 订单查询（按订单号或日期）")
     print("  💰 退款申请与状态查询")
+    print("  🧾 发票查询与申请（动态插件）")
     print("  💬 多轮对话上下文记忆")
     print()
     print("输入 'quit' 或 'exit' 退出\n")
 
     try:
-        agent = create_agent()
+        # Enable logging to see plugin loading
+        # Use force=True to avoid duplicate handlers (Python 3.8+)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(message)s',
+            force=True  # Removes existing handlers first
+        )
+
+        # Disable verbose HTTP request logging from httpx
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('openai').setLevel(logging.WARNING)
+
+        agent = create_agent(include_plugins=True)
+
         print("✅ 系统初始化成功")
         print("💡 测试订单号：ORD001, ORD002, ORD003")
-        print("💡 示例：'查询订单 ORD001'，'我昨天下的订单'，'申请退款'\n")
+        print("💡 测试发票号：INV001, INV002")
+        print("💡 示例：'查询订单 ORD001'，'我昨天下的订单'，'查询发票 INV001'\n")
     except Exception as e:
         print(f"❌ 初始化失败: {e}")
         print("请检查 .env 文件配置")
@@ -438,49 +496,3 @@ def chat_session():
             traceback.print_exc()
 
 
-# ============================================================================
-# Demonstration Functions
-# ============================================================================
-
-def demo_features():
-    """Demonstrate the combined capabilities"""
-    print("=== 功能演示：时间推理 + 工具调用 ===\n")
-
-    current_time = datetime.now()
-    print(f"当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    # Demo 1: Temporal reasoning
-    print("1️⃣  时间推理能力演示")
-    print("-" * 50)
-    test_cases = [
-        "我昨天下的订单",
-        "查询前天的订单",
-        "3天前买的商品"
-    ]
-
-    for case in test_cases:
-        result = calculate_relative_date(case, current_time)
-        print(f"输入: {case}")
-        print(f"解析: {result['processed_text']}")
-        for date_info in result['parsed_dates']:
-            print(f"  → {date_info['relative_term']} = {date_info['actual_date']}")
-        print()
-
-    # Demo 2: Tools
-    print("\n2️⃣  工具调用能力演示")
-    print("-" * 50)
-
-    print("查询订单 ORD001:")
-    print(tools[0].invoke({"order_id": "ORD001"}))
-    print()
-
-    print(f"查询昨天的订单:")
-    yesterday = (current_time - timedelta(days=2)).strftime("%Y-%m-%d")
-    print(tools[1].invoke({"date_str": yesterday}))
-    print()
-
-    print("提交退款:")
-    print(tools[2].invoke({"order_id": "ORD003", "reason": "测试退款"}))
-    print()
-
-    print("\n✅ 演示完成！运行主程序体验完整功能。")
